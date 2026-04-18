@@ -1,11 +1,20 @@
 const express = require("express");
 const { ethers } = require("ethers");
 const cors = require("cors");
+const rateLimit = require("express-rate-limit");
+const { verifyProof } = require("@semaphore-protocol/proof");
 require("dotenv").config();
 
 const app = express();
 app.use(express.json());
 app.use(cors({ origin: process.env.FRONTEND_URL || "*" }));
+
+// Rate limiting — 5 requests per IP per minute
+const limiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 5,
+  message: { error: "Too many requests, slow down" }
+});
 
 // Load relayer wallet from env (NEVER commit this)
 const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
@@ -24,13 +33,20 @@ const registry = new ethers.Contract(
 
 app.get("/health", (_, res) => res.json({ status: "ok" }));
 
-app.post("/relay/apply", async (req, res) => {
+app.post("/relay/apply", limiter, async (req, res) => {
   try {
     const { trialId, proof, commitment, permitRecipient } = req.body;
 
     // Basic input validation
     if (!trialId || !proof || !commitment || !permitRecipient) {
       return res.status(400).json({ error: "Missing required fields" });
+    }
+
+    // ZK proof validation — reject invalid proofs before spending any gas
+    const isValid = await verifyProof(proof);
+    if (!isValid) {
+      console.warn(`Invalid proof rejected for trialId=${trialId}`);
+      return res.status(400).json({ error: "Invalid ZK proof" });
     }
 
     console.log(`Relaying application: trialId=${trialId}, nullifier=${proof.nullifier}`);
