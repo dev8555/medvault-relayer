@@ -22,7 +22,8 @@ const relayerWallet = new ethers.Wallet(process.env.RELAYER_PRIVATE_KEY, provide
 const REGISTRY_ABI = [
   "function applyToTrial(uint256 trialId, tuple(uint256 merkleTreeDepth, uint256 merkleTreeRoot, uint256 nullifier, uint256 message, uint256 scope, uint256[8] points) proof, uint256 commitment, address permitRecipient) external",
   "function hasAppliedToTrial(uint256 trialId, uint256 nullifierHash) external view returns (bool)",
-  "function patientGroupId() external view returns (uint256)"
+  "function patientGroupId() external view returns (uint256)",
+  "function eligibilityEngine() external view returns (address)"
 ];
 
 const SEMAPHORE_ABI = [
@@ -64,6 +65,25 @@ app.post("/relay/apply", limiter, async (req, res) => {
     console.log("ON-CHAIN merkle root:     ", merkleRoot.toString());
     console.log("PROOF merkle root:        ", rawProof.merkleTreeRoot.toString());
     console.log("roots match:              ", merkleRoot.toString() === rawProof.merkleTreeRoot.toString());
+    // ── Check merkle root expiry ─────────────────────────────────────────────
+    try {
+      const SEMAPHORE_FULL_ABI = [
+        "function getMerkleTreeRoot(uint256 groupId) external view returns (uint256)",
+        "function groups(uint256 groupId) external view returns (uint256 merkleTreeDuration)",
+        "function getMerkleTreeCreationDate(uint256 groupId, uint256 root) external view returns (uint256)"
+      ];
+      const semaphoreRead = new ethers.Contract("0x8A1fd199516489B0Fb7153EB5f075cDAC83c693D", SEMAPHORE_FULL_ABI, provider);
+      const rootCreatedAt = await semaphoreRead.getMerkleTreeCreationDate(groupId, BigInt(rawProof.merkleTreeRoot));
+      const duration = await semaphoreRead.groups(groupId);
+      const expiresAt = Number(rootCreatedAt) + Number(duration);
+      const now = Math.floor(Date.now() / 1000);
+      console.log("Root created at:  ", Number(rootCreatedAt), new Date(Number(rootCreatedAt)*1000).toISOString());
+      console.log("merkleTreeDuration:", Number(duration), "seconds");
+      console.log("Root expires at:  ", expiresAt, new Date(expiresAt*1000).toISOString());
+      console.log("Now:              ", now, new Date(now*1000).toISOString());
+      console.log("Root expired:     ", now > expiresAt);
+    } catch(e) { console.log("Expiry check failed:", e.message); }
+
     console.log("─────────────────────────────────────────");
 
     // ── Parse proof fields ────────────────────────────────────────────────────
@@ -117,6 +137,13 @@ app.post("/relay/apply", limiter, async (req, res) => {
     if (alreadyApplied) {
       return res.status(400).json({ error: "Already applied to this trial" });
     }
+
+    // ── Debug: eligibilityEngine address ─────────────────────────────────────
+    try {
+      const engineAddr = await registry.eligibilityEngine();
+      console.log("eligibilityEngine address:", engineAddr);
+      console.log("eligibilityEngine is zero: ", engineAddr === ethers.ZeroAddress);
+    } catch(e) { console.log("eligibilityEngine check failed:", e.message); }
 
     console.log("trialId:        ", trialId);
     console.log("commitment:     ", commitment);
