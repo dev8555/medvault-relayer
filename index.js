@@ -21,7 +21,8 @@ const relayerWallet = new ethers.Wallet(process.env.RELAYER_PRIVATE_KEY, provide
 
 const REGISTRY_ABI = [
   "function applyToTrial(uint256 trialId, tuple(uint256 merkleTreeDepth, uint256 merkleTreeRoot, uint256 nullifier, uint256 message, uint256 scope, uint256[8] points) proof, uint256 commitment, address permitRecipient) external",
-  "function hasAppliedToTrial(uint256 trialId, uint256 nullifierHash) external view returns (bool)"
+  "function hasAppliedToTrial(uint256 trialId, uint256 nullifierHash) external view returns (bool)",
+  "function patientGroupId() external view returns (uint256)"
 ];
 
 const registry = new ethers.Contract(
@@ -33,6 +34,7 @@ const registry = new ethers.Contract(
 app.get("/health", (_, res) => res.json({ status: "ok" }));
 
 app.post("/relay/apply", limiter, async (req, res) => {
+  console.log("─────────────────────────────────────────");
   console.log("RAW PROOF RECEIVED:", JSON.stringify(req.body.proof, null, 2));
   console.log("merkleTreeRoot type:", typeof req.body.proof?.merkleTreeRoot);
 
@@ -42,6 +44,14 @@ app.post("/relay/apply", limiter, async (req, res) => {
     if (!trialId || !rawProof || !commitment || !permitRecipient) {
       return res.status(400).json({ error: "Missing required fields" });
     }
+
+    // ── KEY DEBUG: fetch patientGroupId and compare with proof scope ─────────
+    const groupId = await registry.patientGroupId();
+    console.log("CONTRACT patientGroupId:", groupId.toString());
+    console.log("PROOF scope:            ", rawProof.scope.toString());
+    console.log("PROOF merkleTreeRoot:   ", rawProof.merkleTreeRoot.toString());
+    console.log("scope == groupId:       ", groupId.toString() === rawProof.scope.toString());
+    // ─────────────────────────────────────────────────────────────────────────
 
     let proofForVerify;
     try {
@@ -81,14 +91,9 @@ app.post("/relay/apply", limiter, async (req, res) => {
       return res.status(400).json({ error: "Already applied to this trial" });
     }
 
-    // ── DEBUG: log all values before contract call ───────────────────────────
-    console.log("trialId:", trialId);
-    console.log("commitment:", commitment);
-    console.log("merkleTreeRoot:", proofForContract.merkleTreeRoot);
-    console.log("scope:", proofForContract.scope);
-    console.log("nullifier:", proofForContract.nullifier);
+    console.log("trialId:        ", trialId);
+    console.log("commitment:     ", commitment);
     console.log("permitRecipient:", permitRecipient);
-    // ── END DEBUG ────────────────────────────────────────────────────────────
 
     try {
       await registry.applyToTrial.staticCall(
@@ -97,9 +102,10 @@ app.post("/relay/apply", limiter, async (req, res) => {
         BigInt(commitment),
         permitRecipient
       );
+      console.log("✅ staticCall passed");
     } catch (staticErr) {
       const reason = staticErr.reason ?? staticErr.data ?? staticErr.message;
-      console.error("Static call revert:", reason);
+      console.error("❌ Static call revert:", reason);
       return res.status(400).json({ error: "Contract would revert: " + reason });
     }
 
@@ -114,12 +120,12 @@ app.post("/relay/apply", limiter, async (req, res) => {
     );
 
     const receipt = await tx.wait();
-    console.log(`TX confirmed: ${receipt.hash}`);
+    console.log(`✅ TX confirmed: ${receipt.hash}`);
 
     res.json({ success: true, txHash: receipt.hash });
 
   } catch (err) {
-    console.error("Relay error:", err.message);
+    console.error("❌ Relay error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
