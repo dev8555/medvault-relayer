@@ -92,15 +92,18 @@ app.post("/relay/apply", limiter, async (req, res) => {
     };
 
     // ── Verify consent signal matches what contract expects ───────────────────
+    // Compare as decimal strings to avoid any BigInt reference/type issues
     const expectedMessage = BigInt(ethers.solidityPackedKeccak256(
       ['uint256', 'uint256', 'string'],
       [BigInt(commitment), BigInt(trialId), 'CONSENT']
-    ));
-    console.log("Expected message:", expectedMessage.toString());
-    console.log("Proof message:   ", proofForContract.message.toString());
-    console.log("message match:   ", expectedMessage === proofForContract.message);
+    )).toString();
+    const proofMessage = BigInt(rawProof.message).toString();
 
-    if (expectedMessage !== proofForContract.message) {
+    console.log("Expected message:", expectedMessage);
+    console.log("Proof message:   ", proofMessage);
+    console.log("message match:   ", expectedMessage === proofMessage);
+
+    if (expectedMessage !== proofMessage) {
       return res.status(400).json({ error: "Proof message does not encode consent for this trial" });
     }
 
