@@ -81,14 +81,14 @@ app.post("/relay/apply", limiter, async (req, res) => {
       return res.status(400).json({ error: "Malformed proof fields: " + e.message });
     }
 
-    // Use BigInt for contract calls (fixes encoding issues with large uint256 values)
+    // ethers v6 ABI encoder for tuple structs requires strings/numbers, not BigInt
     const proofForContract = {
       merkleTreeDepth: Number(rawProof.merkleTreeDepth),
-      merkleTreeRoot:  BigInt(rawProof.merkleTreeRoot),
-      nullifier:       BigInt(rawProof.nullifier),
-      message:         BigInt(rawProof.message),
-      scope:           BigInt(rawProof.scope),
-      points:          rawProof.points.map(p => BigInt(p))
+      merkleTreeRoot:  rawProof.merkleTreeRoot.toString(),
+      nullifier:       rawProof.nullifier.toString(),
+      message:         rawProof.message.toString(),
+      scope:           rawProof.scope.toString(),
+      points:          rawProof.points.map(p => p.toString())
     };
 
     // ── Verify consent signal matches what contract expects ───────────────────
