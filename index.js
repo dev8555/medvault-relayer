@@ -56,7 +56,7 @@ app.post("/relay/apply", limiter, async (req, res) => {
       proof,
       commitment,
       permitRecipient,
-      { gasLimit: 500_000 }
+      { gasLimit: 2_000_000 }
     );
 
     const receipt = await tx.wait();
