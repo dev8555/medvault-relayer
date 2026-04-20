@@ -25,9 +25,20 @@ const REGISTRY_ABI = [
   "function patientGroupId() external view returns (uint256)"
 ];
 
+const SEMAPHORE_ABI = [
+  "function getMerkleTreeDuration(uint256 groupId) external view returns (uint256)",
+  "function getMerkleTreeRoot(uint256 groupId) external view returns (uint256)"
+];
+
 const registry = new ethers.Contract(
   process.env.REGISTRY_ADDRESS,
   REGISTRY_ABI,
+  relayerWallet
+);
+
+const semaphore = new ethers.Contract(
+  "0x8A1fd199516489B0Fb7153EB5f075cDAC83c693D",
+  SEMAPHORE_ABI,
   relayerWallet
 );
 
@@ -45,12 +56,20 @@ app.post("/relay/apply", limiter, async (req, res) => {
       return res.status(400).json({ error: "Missing required fields" });
     }
 
-    // ── KEY DEBUG: fetch patientGroupId and compare with proof scope ─────────
+    // ── Group + Merkle root debug ─────────────────────────────────────────────
     const groupId = await registry.patientGroupId();
-    console.log("CONTRACT patientGroupId:", groupId.toString());
-    console.log("PROOF scope:            ", rawProof.scope.toString());
-    console.log("PROOF merkleTreeRoot:   ", rawProof.merkleTreeRoot.toString());
-    console.log("scope == groupId:       ", groupId.toString() === rawProof.scope.toString());
+    const merkleRoot = await semaphore.getMerkleTreeRoot(groupId);
+    const duration = await semaphore.getMerkleTreeDuration(groupId);
+
+    console.log("CONTRACT patientGroupId:  ", groupId.toString());
+    console.log("PROOF scope:              ", rawProof.scope.toString());
+    console.log("scope == groupId:         ", groupId.toString() === rawProof.scope.toString());
+    console.log("─────────────────────────────────────────");
+    console.log("ON-CHAIN merkle root:     ", merkleRoot.toString());
+    console.log("PROOF merkle root:        ", rawProof.merkleTreeRoot.toString());
+    console.log("roots match:              ", merkleRoot.toString() === rawProof.merkleTreeRoot.toString());
+    console.log("merkle root duration(s):  ", duration.toString());
+    console.log("─────────────────────────────────────────");
     // ─────────────────────────────────────────────────────────────────────────
 
     let proofForVerify;
@@ -109,7 +128,7 @@ app.post("/relay/apply", limiter, async (req, res) => {
       return res.status(400).json({ error: "Contract would revert: " + reason });
     }
 
-    console.log(`Relaying application: trialId=${trialId}, nullifier=${rawProof.nullifier}`);
+    console.log(`Relaying: trialId=${trialId}, nullifier=${rawProof.nullifier}`);
 
     const tx = await registry.applyToTrial(
       BigInt(trialId),
