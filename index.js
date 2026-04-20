@@ -20,7 +20,7 @@ const limiter = rateLimit({
 const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
 const relayerWallet = new ethers.Wallet(process.env.RELAYER_PRIVATE_KEY, provider);
 
-// MedVaultRegistry ABI — only the function you need
+// MedVaultRegistry ABI — only the functions we need
 const REGISTRY_ABI = [
   "function applyToTrial(uint256 trialId, tuple(uint256 merkleTreeDepth, uint256 merkleTreeRoot, uint256 nullifier, uint256 message, uint256 scope, uint256[8] points) proof, uint256 commitment, address permitRecipient) external",
   "function hasAppliedToTrial(uint256 trialId, uint256 nullifierHash) external view returns (bool)"
@@ -31,20 +31,6 @@ const registry = new ethers.Contract(
   REGISTRY_ABI,
   relayerWallet
 );
-
-// ── Helper: deserialize proof fields from JSON strings → BigInt ──────────────
-// Proof fields are serialized as strings over HTTP (JSON can't handle BigInt).
-// @semaphore-protocol/proof and ethers both require BigInt internally.
-function deserializeProof(raw) {
-  return {
-    merkleTreeDepth: Number(raw.merkleTreeDepth),
-    merkleTreeRoot: BigInt(raw.merkleTreeRoot),
-    nullifier:      BigInt(raw.nullifier),
-    message:        BigInt(raw.message),
-    scope:          BigInt(raw.scope),
-    points:         raw.points.map(p => BigInt(p))
-  };
-}
 
 app.get("/health", (_, res) => res.json({ status: "ok" }));
 
@@ -57,35 +43,54 @@ app.post("/relay/apply", limiter, async (req, res) => {
       return res.status(400).json({ error: "Missing required fields" });
     }
 
-    // ── 2. Deserialize BigInts before any proof work ─────────────────────────
-    let proof;
+    // ── 2. Two proof shapes: verifyProof needs BigInt, ethers needs strings ──
+
+    // For @semaphore-protocol/proof verifyProof — requires BigInt fields
+    let proofForVerify;
     try {
-      proof = deserializeProof(rawProof);
+      proofForVerify = {
+        merkleTreeDepth: Number(rawProof.merkleTreeDepth),
+        merkleTreeRoot:  BigInt(rawProof.merkleTreeRoot),
+        nullifier:       BigInt(rawProof.nullifier),
+        message:         BigInt(rawProof.message),
+        scope:           BigInt(rawProof.scope),
+        points:          rawProof.points.map(p => BigInt(p))
+      };
     } catch (e) {
       return res.status(400).json({ error: "Malformed proof fields: " + e.message });
     }
 
+    // For ethers v6 ABI encoder — requires string fields for uint256
+    const proofForContract = {
+      merkleTreeDepth: Number(rawProof.merkleTreeDepth),
+      merkleTreeRoot:  rawProof.merkleTreeRoot.toString(),
+      nullifier:       rawProof.nullifier.toString(),
+      message:         rawProof.message.toString(),
+      scope:           rawProof.scope.toString(),
+      points:          rawProof.points.map(p => p.toString())
+    };
+
     // ── 3. ZK proof validation — reject invalid proofs before spending gas ───
-    const isValid = await verifyProof(proof);
+    const isValid = await verifyProof(proofForVerify);
     if (!isValid) {
       console.warn(`Invalid proof rejected for trialId=${trialId}`);
       return res.status(400).json({ error: "Invalid ZK proof" });
     }
 
-    // ── 4. Nullifier reuse check — give clean error instead of on-chain revert
+    // ── 4. Nullifier reuse check — clean error instead of on-chain revert ───
     const alreadyApplied = await registry.hasAppliedToTrial(
       BigInt(trialId),
-      proof.nullifier
+      BigInt(rawProof.nullifier)
     );
     if (alreadyApplied) {
       return res.status(400).json({ error: "Already applied to this trial" });
     }
 
-    // ── 5. Dry-run staticCall — surfaces the exact revert reason if any ──────
+    // ── 5. Dry-run staticCall — surfaces exact revert reason if any ──────────
     try {
       await registry.applyToTrial.staticCall(
         BigInt(trialId),
-        proof,
+        proofForContract,
         BigInt(commitment),
         permitRecipient
       );
@@ -96,11 +101,11 @@ app.post("/relay/apply", limiter, async (req, res) => {
     }
 
     // ── 6. Broadcast the real transaction ────────────────────────────────────
-    console.log(`Relaying application: trialId=${trialId}, nullifier=${proof.nullifier}`);
+    console.log(`Relaying application: trialId=${trialId}, nullifier=${rawProof.nullifier}`);
 
     const tx = await registry.applyToTrial(
       BigInt(trialId),
-      proof,
+      proofForContract,
       BigInt(commitment),
       permitRecipient,
       { gasLimit: 2_000_000 }
