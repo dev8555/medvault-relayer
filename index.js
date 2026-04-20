@@ -107,12 +107,7 @@ app.post("/relay/apply", limiter, async (req, res) => {
       return res.status(400).json({ error: "Proof message does not encode consent for this trial" });
     }
 
-    // ── Off-chain ZK proof verification ──────────────────────────────────────
-    const isValid = await verifyProof(proofForVerify);
-    if (!isValid) {
-      return res.status(400).json({ error: "Invalid ZK proof" });
-    }
-    console.log("✅ Off-chain proof valid");
+    // Off-chain verifyProof skipped — contract's verifyProof handles this on-chain
 
     // ── Check already applied ─────────────────────────────────────────────────
     const alreadyApplied = await registry.hasAppliedToTrial(
