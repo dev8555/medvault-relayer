@@ -27,8 +27,7 @@ const REGISTRY_ABI = [
 
 const SEMAPHORE_ABI = [
   "function getMerkleTreeRoot(uint256 groupId) external view returns (uint256)",
-  "function getMerkleTreeSize(uint256 groupId) external view returns (uint256)",
-  "function groups(uint256 groupId) external view returns (uint256 merkleTreeDuration, uint256 merkleTreeExpiry)"
+  "function getMerkleTreeSize(uint256 groupId) external view returns (uint256)"
 ];
 
 const registry = new ethers.Contract(
@@ -48,7 +47,6 @@ app.get("/health", (_, res) => res.json({ status: "ok" }));
 app.post("/relay/apply", limiter, async (req, res) => {
   console.log("─────────────────────────────────────────");
   console.log("RAW PROOF RECEIVED:", JSON.stringify(req.body.proof, null, 2));
-  console.log("merkleTreeRoot type:", typeof req.body.proof?.merkleTreeRoot);
 
   try {
     const { trialId, proof: rawProof, commitment, permitRecipient } = req.body;
@@ -57,32 +55,18 @@ app.post("/relay/apply", limiter, async (req, res) => {
       return res.status(400).json({ error: "Missing required fields" });
     }
 
-    // ── Group + Merkle root debug ─────────────────────────────────────────────
+    // ── Debug: group + merkle root ────────────────────────────────────────────
     const groupId = await registry.patientGroupId();
     const merkleRoot = await semaphore.getMerkleTreeRoot(groupId);
 
     console.log("CONTRACT patientGroupId:  ", groupId.toString());
     console.log("PROOF scope:              ", rawProof.scope.toString());
-    console.log("scope == groupId:         ", groupId.toString() === rawProof.scope.toString());
-    console.log("─────────────────────────────────────────");
     console.log("ON-CHAIN merkle root:     ", merkleRoot.toString());
     console.log("PROOF merkle root:        ", rawProof.merkleTreeRoot.toString());
     console.log("roots match:              ", merkleRoot.toString() === rawProof.merkleTreeRoot.toString());
-
-    // Try to get group expiry info
-    try {
-      const groupInfo = await semaphore.groups(groupId);
-      console.log("merkleTreeDuration(s):    ", groupInfo.merkleTreeDuration.toString());
-      console.log("merkleTreeExpiry:         ", groupInfo.merkleTreeExpiry.toString());
-      const now = Math.floor(Date.now() / 1000);
-      console.log("current timestamp:        ", now);
-      console.log("root expired:             ", now > Number(groupInfo.merkleTreeExpiry));
-    } catch (e) {
-      console.log("groups() call failed:     ", e.message);
-    }
     console.log("─────────────────────────────────────────");
-    // ─────────────────────────────────────────────────────────────────────────
 
+    // ── Parse proof fields ────────────────────────────────────────────────────
     let proofForVerify;
     try {
       proofForVerify = {
@@ -97,22 +81,37 @@ app.post("/relay/apply", limiter, async (req, res) => {
       return res.status(400).json({ error: "Malformed proof fields: " + e.message });
     }
 
+    // Use BigInt for contract calls (fixes encoding issues with large uint256 values)
     const proofForContract = {
       merkleTreeDepth: Number(rawProof.merkleTreeDepth),
-      merkleTreeRoot:  rawProof.merkleTreeRoot.toString(),
-      nullifier:       rawProof.nullifier.toString(),
-      message:         rawProof.message.toString(),
-      scope:           rawProof.scope.toString(),
-      points:          rawProof.points.map(p => p.toString())
+      merkleTreeRoot:  BigInt(rawProof.merkleTreeRoot),
+      nullifier:       BigInt(rawProof.nullifier),
+      message:         BigInt(rawProof.message),
+      scope:           BigInt(rawProof.scope),
+      points:          rawProof.points.map(p => BigInt(p))
     };
 
-    // TEMP: skipping verifyProof to isolate the error source
-    // const isValid = await verifyProof(proofForVerify);
-    // if (!isValid) {
-    //   return res.status(400).json({ error: "Invalid ZK proof" });
-    // }
-    console.log("Skipping verifyProof for debug");
+    // ── Verify consent signal matches what contract expects ───────────────────
+    const expectedMessage = BigInt(ethers.solidityPackedKeccak256(
+      ['uint256', 'uint256', 'string'],
+      [BigInt(commitment), BigInt(trialId), 'CONSENT']
+    ));
+    console.log("Expected message:", expectedMessage.toString());
+    console.log("Proof message:   ", proofForContract.message.toString());
+    console.log("message match:   ", expectedMessage === proofForContract.message);
 
+    if (expectedMessage !== proofForContract.message) {
+      return res.status(400).json({ error: "Proof message does not encode consent for this trial" });
+    }
+
+    // ── Off-chain ZK proof verification ──────────────────────────────────────
+    const isValid = await verifyProof(proofForVerify);
+    if (!isValid) {
+      return res.status(400).json({ error: "Invalid ZK proof" });
+    }
+    console.log("✅ Off-chain proof valid");
+
+    // ── Check already applied ─────────────────────────────────────────────────
     const alreadyApplied = await registry.hasAppliedToTrial(
       BigInt(trialId),
       BigInt(rawProof.nullifier)
@@ -125,6 +124,7 @@ app.post("/relay/apply", limiter, async (req, res) => {
     console.log("commitment:     ", commitment);
     console.log("permitRecipient:", permitRecipient);
 
+    // ── Static call simulation ────────────────────────────────────────────────
     try {
       await registry.applyToTrial.staticCall(
         BigInt(trialId),
@@ -139,6 +139,7 @@ app.post("/relay/apply", limiter, async (req, res) => {
       return res.status(400).json({ error: "Contract would revert: " + reason });
     }
 
+    // ── Submit transaction ────────────────────────────────────────────────────
     console.log(`Relaying: trialId=${trialId}, nullifier=${rawProof.nullifier}`);
 
     const tx = await registry.applyToTrial(
