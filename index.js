@@ -6,7 +6,7 @@ const { verifyProof } = require("@semaphore-protocol/proof");
 require("dotenv").config();
 
 const app = express();
-app.set('trust proxy', 1); // ← Railway sits behind a proxy
+app.set('trust proxy', 1);
 app.use(express.json());
 app.use(cors({ origin: process.env.FRONTEND_URL || "*" }));
 
@@ -80,6 +80,15 @@ app.post("/relay/apply", limiter, async (req, res) => {
     if (alreadyApplied) {
       return res.status(400).json({ error: "Already applied to this trial" });
     }
+
+    // ── DEBUG: log all values before contract call ───────────────────────────
+    console.log("trialId:", trialId);
+    console.log("commitment:", commitment);
+    console.log("merkleTreeRoot:", proofForContract.merkleTreeRoot);
+    console.log("scope:", proofForContract.scope);
+    console.log("nullifier:", proofForContract.nullifier);
+    console.log("permitRecipient:", permitRecipient);
+    // ── END DEBUG ────────────────────────────────────────────────────────────
 
     try {
       await registry.applyToTrial.staticCall(
