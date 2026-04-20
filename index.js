@@ -26,8 +26,9 @@ const REGISTRY_ABI = [
 ];
 
 const SEMAPHORE_ABI = [
-  "function getMerkleTreeDuration(uint256 groupId) external view returns (uint256)",
-  "function getMerkleTreeRoot(uint256 groupId) external view returns (uint256)"
+  "function getMerkleTreeRoot(uint256 groupId) external view returns (uint256)",
+  "function getMerkleTreeSize(uint256 groupId) external view returns (uint256)",
+  "function groups(uint256 groupId) external view returns (uint256 merkleTreeDuration, uint256 merkleTreeExpiry)"
 ];
 
 const registry = new ethers.Contract(
@@ -59,7 +60,6 @@ app.post("/relay/apply", limiter, async (req, res) => {
     // ── Group + Merkle root debug ─────────────────────────────────────────────
     const groupId = await registry.patientGroupId();
     const merkleRoot = await semaphore.getMerkleTreeRoot(groupId);
-    const duration = await semaphore.getMerkleTreeDuration(groupId);
 
     console.log("CONTRACT patientGroupId:  ", groupId.toString());
     console.log("PROOF scope:              ", rawProof.scope.toString());
@@ -68,7 +68,18 @@ app.post("/relay/apply", limiter, async (req, res) => {
     console.log("ON-CHAIN merkle root:     ", merkleRoot.toString());
     console.log("PROOF merkle root:        ", rawProof.merkleTreeRoot.toString());
     console.log("roots match:              ", merkleRoot.toString() === rawProof.merkleTreeRoot.toString());
-    console.log("merkle root duration(s):  ", duration.toString());
+
+    // Try to get group expiry info
+    try {
+      const groupInfo = await semaphore.groups(groupId);
+      console.log("merkleTreeDuration(s):    ", groupInfo.merkleTreeDuration.toString());
+      console.log("merkleTreeExpiry:         ", groupInfo.merkleTreeExpiry.toString());
+      const now = Math.floor(Date.now() / 1000);
+      console.log("current timestamp:        ", now);
+      console.log("root expired:             ", now > Number(groupInfo.merkleTreeExpiry));
+    } catch (e) {
+      console.log("groups() call failed:     ", e.message);
+    }
     console.log("─────────────────────────────────────────");
     // ─────────────────────────────────────────────────────────────────────────
 
