@@ -35,6 +35,13 @@ const registry = new ethers.Contract(
 app.get("/health", (_, res) => res.json({ status: "ok" }));
 
 app.post("/relay/apply", limiter, async (req, res) => {
+  // ── DEBUG LOGS ────────────────────────────────────────────────────────────
+  console.log("RAW PROOF RECEIVED:", JSON.stringify(req.body.proof, null, 2));
+  console.log("merkleTreeRoot type:", typeof req.body.proof?.merkleTreeRoot);
+  console.log("nullifier type:", typeof req.body.proof?.nullifier);
+  console.log("points[0] type:", typeof req.body.proof?.points?.[0]);
+  // ── END DEBUG ─────────────────────────────────────────────────────────────
+
   try {
     const { trialId, proof: rawProof, commitment, permitRecipient } = req.body;
 
@@ -69,6 +76,9 @@ app.post("/relay/apply", limiter, async (req, res) => {
       scope:           rawProof.scope.toString(),
       points:          rawProof.points.map(p => p.toString())
     };
+
+    console.log("proofForContract.merkleTreeRoot type:", typeof proofForContract.merkleTreeRoot);
+    console.log("proofForContract.merkleTreeRoot value:", proofForContract.merkleTreeRoot);
 
     // ── 3. ZK proof validation — reject invalid proofs before spending gas ───
     const isValid = await verifyProof(proofForVerify);
