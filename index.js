@@ -30,13 +30,13 @@ const REGISTRY_ABI = [
   "function applyToTrial(uint256 trialId, tuple(uint256 merkleTreeDepth, uint256 merkleTreeRoot, uint256 nullifier, uint256 message, uint256 scope, uint256[8] points) proof, uint256 commitment, address permitRecipient) external",
   "function hasAppliedToTrial(uint256 trialId, uint256 nullifierHash) external view returns (bool)",
   "function patientGroupId() external view returns (uint256)",
-  "function eligibilityEngine() external view returns (address)"
+  "function eligibilityEngine() external view returns (address)",
+  "function semaphore() external view returns (address)"
 ];
 
-const SEMAPHORE_FULL_ABI = [
+const SEMAPHORE_ABI = [
+  "function verifyProof(uint256 groupId, tuple(uint256 merkleTreeDepth, uint256 merkleTreeRoot, uint256 nullifier, uint256 message, uint256 scope, uint256[8] points) proof) external view returns (bool)",
   "function getMerkleTreeRoot(uint256 groupId) external view returns (uint256)",
-  "function groups(uint256 groupId) external view returns (uint256 merkleTreeDuration)",
-  "function getMerkleTreeCreationDate(uint256 groupId, uint256 root) external view returns (uint256)"
 ];
 
 const registry = new ethers.Contract(
@@ -47,11 +47,45 @@ const registry = new ethers.Contract(
 
 const semaphore = new ethers.Contract(
   SEMAPHORE_ADDRESS,
-  SEMAPHORE_FULL_ABI,
+  SEMAPHORE_ABI,
   provider
 );
 
 app.get("/health", (_, res) => res.json({ status: "ok" }));
+
+function toBigInt(value, fieldName) {
+  try {
+    return BigInt(value);
+  } catch {
+    throw new Error(`Invalid ${fieldName}`);
+  }
+}
+
+function extractErrorMessage(err) {
+  if (!err) return "Unknown error";
+  return err.shortMessage ?? err.reason ?? err.message ?? String(err);
+}
+
+async function runStartupChecks() {
+  if (!ethers.isAddress(REGISTRY_ADDRESS) || !ethers.isAddress(SEMAPHORE_ADDRESS)) {
+    throw new Error("REGISTRY_ADDRESS or SEMAPHORE_ADDRESS is not a valid address");
+  }
+
+  const network = await provider.getNetwork();
+  if (network.chainId !== 421614n) {
+    throw new Error(`Unexpected chainId ${network.chainId.toString()} (expected 421614)`);
+  }
+
+  const configuredSemaphore = await registry.semaphore();
+  if (configuredSemaphore.toLowerCase() !== SEMAPHORE_ADDRESS.toLowerCase()) {
+    throw new Error("SEMAPHORE_ADDRESS does not match registry.semaphore()");
+  }
+
+  const eligibilityEngine = await registry.eligibilityEngine();
+  if (eligibilityEngine === ethers.ZeroAddress) {
+    throw new Error("registry.eligibilityEngine() is zero address");
+  }
+}
 
 app.post("/relay/apply", limiter, async (req, res) => {
   console.log("─────────────────────────────────────────");
@@ -67,47 +101,16 @@ app.post("/relay/apply", limiter, async (req, res) => {
     // ── Fetch groupId ─────────────────────────────────────────────
     const groupId = await registry.patientGroupId();
 
-    // ── 🚨 HARD EXPIRY CHECK (BEFORE EVERYTHING) ──────────────────
-    try {
-      const root = BigInt(rawProof.merkleTreeRoot);
-
-      const rootCreatedAt = await semaphore.getMerkleTreeCreationDate(groupId, root);
-      const duration = await semaphore.groups(groupId);
-
-      const expiresAt = Number(rootCreatedAt) + Number(duration);
-      const now = Math.floor(Date.now() / 1000);
-
-      console.log("Root created at:", Number(rootCreatedAt));
-      console.log("Duration:", Number(duration));
-      console.log("Expires at:", expiresAt);
-      console.log("Now:", now);
-
-      if (now > expiresAt) {
-        console.log("❌ ROOT EXPIRED - ABORTING EARLY");
-        return res.status(400).json({
-          error: "Merkle root expired",
-          expiresAt,
-          now
-        });
-      }
-
-    } catch (e) {
-      console.error("❌ Expiry check failed:", e.message);
-      return res.status(400).json({ error: "Failed to validate merkle root expiry" });
-    }
-
-    console.log("─────────────────────────────────────────");
-
     // ── Parse proof ───────────────────────────────────────────────
     let proofForContract;
     try {
       proofForContract = {
-        merkleTreeDepth: Number(rawProof.merkleTreeDepth),
-        merkleTreeRoot: rawProof.merkleTreeRoot.toString(),
-        nullifier: rawProof.nullifier.toString(),
-        message: rawProof.message.toString(),
-        scope: rawProof.scope.toString(),
-        points: rawProof.points.map(p => p.toString())
+        merkleTreeDepth: toBigInt(rawProof.merkleTreeDepth, "proof.merkleTreeDepth"),
+        merkleTreeRoot: toBigInt(rawProof.merkleTreeRoot, "proof.merkleTreeRoot"),
+        nullifier: toBigInt(rawProof.nullifier, "proof.nullifier"),
+        message: toBigInt(rawProof.message, "proof.message"),
+        scope: toBigInt(rawProof.scope, "proof.scope"),
+        points: rawProof.points.map((p, idx) => toBigInt(p, `proof.points[${idx}]`))
       };
     } catch (e) {
       return res.status(400).json({ error: "Malformed proof fields: " + e.message });
@@ -129,6 +132,20 @@ app.post("/relay/apply", limiter, async (req, res) => {
       });
     }
 
+    // ── Semaphore proof preflight (same core verification path) ──
+    try {
+      const isValidProof = await semaphore.verifyProof(groupId, proofForContract);
+      if (!isValidProof) {
+        return res.status(400).json({
+          error: "Semaphore proof invalid (expired root, unknown root, nullifier reused, or malformed proof)"
+        });
+      }
+    } catch (proofErr) {
+      const reason = extractErrorMessage(proofErr);
+      console.error("❌ Semaphore verifyProof failed:", reason);
+      return res.status(400).json({ error: "Semaphore proof verification failed: " + reason });
+    }
+
     // ── Already applied check ─────────────────────────────────────
     const alreadyApplied = await registry.hasAppliedToTrial(
       BigInt(trialId),
@@ -142,27 +159,36 @@ app.post("/relay/apply", limiter, async (req, res) => {
     // ── Static call ───────────────────────────────────────────────
     try {
       await registry.applyToTrial.staticCall(
-        BigInt(trialId),
+        toBigInt(trialId, "trialId"),
         proofForContract,
-        BigInt(commitment),
+        toBigInt(commitment, "commitment"),
         permitRecipient
       );
       console.log("✅ staticCall passed");
     } catch (staticErr) {
-      const reason = staticErr.reason ?? staticErr.data ?? staticErr.message;
+      const reason = extractErrorMessage(staticErr);
       console.error("❌ Static call revert:", reason);
       return res.status(400).json({ error: "Contract would revert: " + reason });
     }
 
     // ── Send TX ───────────────────────────────────────────────────
     console.log(`Relaying: trialId=${trialId}`);
+    const trialIdBI = toBigInt(trialId, "trialId");
+    const commitmentBI = toBigInt(commitment, "commitment");
+    const estimatedGas = await registry.applyToTrial.estimateGas(
+      trialIdBI,
+      proofForContract,
+      commitmentBI,
+      permitRecipient
+    );
+    const gasLimit = (estimatedGas * 130n) / 100n;
 
     const tx = await registry.applyToTrial(
-      BigInt(trialId),
+      trialIdBI,
       proofForContract,
-      BigInt(commitment),
+      commitmentBI,
       permitRecipient,
-      { gasLimit: 2_000_000 }
+      { gasLimit }
     );
 
     const receipt = await tx.wait();
@@ -172,10 +198,19 @@ app.post("/relay/apply", limiter, async (req, res) => {
     res.json({ success: true, txHash: receipt.hash });
 
   } catch (err) {
-    console.error("❌ Relay error:", err.message);
-    res.status(500).json({ error: err.message });
+    const reason = extractErrorMessage(err);
+    console.error("❌ Relay error:", reason);
+    res.status(500).json({ error: reason });
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Relayer running on port ${PORT}`));
+
+runStartupChecks()
+  .then(() => {
+    app.listen(PORT, () => console.log(`Relayer running on port ${PORT}`));
+  })
+  .catch((err) => {
+    console.error("Startup checks failed:", extractErrorMessage(err));
+    process.exit(1);
+  });
