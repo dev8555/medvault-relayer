@@ -97,6 +97,10 @@ app.post("/relay/apply", limiter, async (req, res) => {
     if (!trialId || !rawProof || !commitment || !permitRecipient) {
       return res.status(400).json({ error: "Missing required fields" });
     }
+    if (!ethers.isAddress(permitRecipient)) {
+      return res.status(400).json({ error: "permitRecipient must be a valid address" });
+    }
+    const permitRecipientAddr = ethers.getAddress(permitRecipient);
 
     // ── Fetch groupId ─────────────────────────────────────────────
     const groupId = await registry.patientGroupId();
@@ -116,11 +120,12 @@ app.post("/relay/apply", limiter, async (req, res) => {
       return res.status(400).json({ error: "Malformed proof fields: " + e.message });
     }
 
-    // ── Verify consent signal ─────────────────────────────────────
+    // ── Verify consent signal (must match MedVaultRegistry + frontend semaphore.ts) ──
+    // keccak256(abi.encodePacked(commitment, trialId, permitRecipient, "CONSENT"))
     const expectedMessage = BigInt(
       ethers.solidityPackedKeccak256(
-        ["uint256", "uint256", "string"],
-        [BigInt(commitment), BigInt(trialId), "CONSENT"]
+        ["uint256", "uint256", "address", "string"],
+        [BigInt(commitment), BigInt(trialId), permitRecipientAddr, "CONSENT"]
       )
     ).toString();
 
@@ -162,7 +167,7 @@ app.post("/relay/apply", limiter, async (req, res) => {
         toBigInt(trialId, "trialId"),
         proofForContract,
         toBigInt(commitment, "commitment"),
-        permitRecipient
+        permitRecipientAddr
       );
       console.log("✅ staticCall passed");
     } catch (staticErr) {
@@ -179,7 +184,7 @@ app.post("/relay/apply", limiter, async (req, res) => {
       trialIdBI,
       proofForContract,
       commitmentBI,
-      permitRecipient
+      permitRecipientAddr
     );
     const gasLimit = (estimatedGas * 130n) / 100n;
 
@@ -187,7 +192,7 @@ app.post("/relay/apply", limiter, async (req, res) => {
       trialIdBI,
       proofForContract,
       commitmentBI,
-      permitRecipient,
+      permitRecipientAddr,
       { gasLimit }
     );
 
