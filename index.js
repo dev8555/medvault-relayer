@@ -18,7 +18,6 @@ const limiter = rateLimit({
 const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
 const relayerWallet = new ethers.Wallet(process.env.RELAYER_PRIVATE_KEY, provider);
 
-// ✅ ENV-BASED ADDRESSES
 const REGISTRY_ADDRESS = process.env.REGISTRY_ADDRESS;
 const SEMAPHORE_ADDRESS = process.env.SEMAPHORE_ADDRESS;
 
@@ -27,7 +26,8 @@ if (!REGISTRY_ADDRESS || !SEMAPHORE_ADDRESS) {
 }
 
 const REGISTRY_ABI = [
-  "function applyToTrial(uint256 trialId, tuple(uint256 merkleTreeDepth, uint256 merkleTreeRoot, uint256 nullifier, uint256 message, uint256 scope, uint256[8] points) proof, uint256 commitment, address permitRecipient) external",
+  "function stageAnonymousApply(uint256 trialId, tuple(uint256 merkleTreeDepth, uint256 merkleTreeRoot, uint256 nullifier, uint256 message, uint256 scope, uint256[8] points) proof, uint256 commitment, address permitRecipient) external",
+  "function finalizeAnonymousApply(uint256 trialId, tuple(uint256 merkleTreeDepth, uint256 merkleTreeRoot, uint256 nullifier, uint256 message, uint256 scope, uint256[8] points) proof, uint256 commitment, address permitRecipient, bool decryptedEligible, bytes decryptSig) external",
   "function hasAppliedToTrial(uint256 trialId, uint256 nullifierHash) external view returns (bool)",
   "function patientGroupId() external view returns (uint256)",
   "function eligibilityEngine() external view returns (address)",
@@ -39,17 +39,9 @@ const SEMAPHORE_ABI = [
   "function getMerkleTreeRoot(uint256 groupId) external view returns (uint256)",
 ];
 
-const registry = new ethers.Contract(
-  REGISTRY_ADDRESS,
-  REGISTRY_ABI,
-  relayerWallet
-);
+const registry = new ethers.Contract(REGISTRY_ADDRESS, REGISTRY_ABI, relayerWallet);
 
-const semaphore = new ethers.Contract(
-  SEMAPHORE_ADDRESS,
-  SEMAPHORE_ABI,
-  provider
-);
+const semaphore = new ethers.Contract(SEMAPHORE_ADDRESS, SEMAPHORE_ABI, provider);
 
 app.get("/health", (_, res) => res.json({ status: "ok" }));
 
@@ -64,6 +56,17 @@ function toBigInt(value, fieldName) {
 function extractErrorMessage(err) {
   if (!err) return "Unknown error";
   return err.shortMessage ?? err.reason ?? err.message ?? String(err);
+}
+
+function parseProofFromBody(rawProof) {
+  return {
+    merkleTreeDepth: toBigInt(rawProof.merkleTreeDepth, "proof.merkleTreeDepth"),
+    merkleTreeRoot: toBigInt(rawProof.merkleTreeRoot, "proof.merkleTreeRoot"),
+    nullifier: toBigInt(rawProof.nullifier, "proof.nullifier"),
+    message: toBigInt(rawProof.message, "proof.message"),
+    scope: toBigInt(rawProof.scope, "proof.scope"),
+    points: rawProof.points.map((p, idx) => toBigInt(p, `proof.points[${idx}]`))
+  };
 }
 
 async function runStartupChecks() {
@@ -87,126 +90,190 @@ async function runStartupChecks() {
   }
 }
 
-app.post("/relay/apply", limiter, async (req, res) => {
-  console.log("─────────────────────────────────────────");
-  console.log("RAW PROOF RECEIVED:", JSON.stringify(req.body.proof, null, 2));
+async function validateConsentAndSemaphoreProof(reqBody, preflightLabel) {
+  const { trialId, proof: rawProof, commitment, permitRecipient } = reqBody;
+
+  if (!trialId || !rawProof || !commitment || !permitRecipient) {
+    return { error: "Missing required fields", status: 400 };
+  }
+  if (!ethers.isAddress(permitRecipient)) {
+    return { error: "permitRecipient must be a valid address", status: 400 };
+  }
+  const permitRecipientAddr = ethers.getAddress(permitRecipient);
+
+  const groupId = await registry.patientGroupId();
+
+  let proofForContract;
+  try {
+    proofForContract = parseProofFromBody(rawProof);
+  } catch (e) {
+    return { error: "Malformed proof fields: " + e.message, status: 400 };
+  }
+
+  const expectedMessage = BigInt(
+    ethers.solidityPackedKeccak256(
+      ["uint256", "uint256", "address", "string"],
+      [BigInt(commitment), BigInt(trialId), permitRecipientAddr, "CONSENT"]
+    )
+  ).toString();
+
+  const proofMessage = BigInt(rawProof.message).toString();
+
+  if (expectedMessage !== proofMessage) {
+    return { error: "Proof message does not encode consent for this trial", status: 400 };
+  }
 
   try {
-    const { trialId, proof: rawProof, commitment, permitRecipient } = req.body;
-
-    if (!trialId || !rawProof || !commitment || !permitRecipient) {
-      return res.status(400).json({ error: "Missing required fields" });
-    }
-    if (!ethers.isAddress(permitRecipient)) {
-      return res.status(400).json({ error: "permitRecipient must be a valid address" });
-    }
-    const permitRecipientAddr = ethers.getAddress(permitRecipient);
-
-    // ── Fetch groupId ─────────────────────────────────────────────
-    const groupId = await registry.patientGroupId();
-
-    // ── Parse proof ───────────────────────────────────────────────
-    let proofForContract;
-    try {
-      proofForContract = {
-        merkleTreeDepth: toBigInt(rawProof.merkleTreeDepth, "proof.merkleTreeDepth"),
-        merkleTreeRoot: toBigInt(rawProof.merkleTreeRoot, "proof.merkleTreeRoot"),
-        nullifier: toBigInt(rawProof.nullifier, "proof.nullifier"),
-        message: toBigInt(rawProof.message, "proof.message"),
-        scope: toBigInt(rawProof.scope, "proof.scope"),
-        points: rawProof.points.map((p, idx) => toBigInt(p, `proof.points[${idx}]`))
+    const isValidProof = await semaphore.verifyProof(groupId, proofForContract);
+    if (!isValidProof) {
+      return {
+        error: "Semaphore proof invalid (expired root, unknown root, nullifier reused, or malformed proof)",
+        status: 400
       };
-    } catch (e) {
-      return res.status(400).json({ error: "Malformed proof fields: " + e.message });
     }
+  } catch (proofErr) {
+    const reason = extractErrorMessage(proofErr);
+    console.error(`❌ Semaphore verifyProof failed (${preflightLabel}):`, reason);
+    return { error: "Semaphore proof verification failed: " + reason, status: 400 };
+  }
 
-    // ── Verify consent signal (must match MedVaultRegistry + frontend semaphore.ts) ──
-    // keccak256(abi.encodePacked(commitment, trialId, permitRecipient, "CONSENT"))
-    const expectedMessage = BigInt(
-      ethers.solidityPackedKeccak256(
-        ["uint256", "uint256", "address", "string"],
-        [BigInt(commitment), BigInt(trialId), permitRecipientAddr, "CONSENT"]
-      )
-    ).toString();
+  const alreadyApplied = await registry.hasAppliedToTrial(BigInt(trialId), BigInt(rawProof.nullifier));
 
-    const proofMessage = BigInt(rawProof.message).toString();
+  if (alreadyApplied) {
+    return { error: "Already applied to this trial", status: 400 };
+  }
 
-    if (expectedMessage !== proofMessage) {
-      return res.status(400).json({
-        error: "Proof message does not encode consent for this trial"
-      });
-    }
+  return {
+    ok: true,
+    trialIdBI: toBigInt(trialId, "trialId"),
+    commitmentBI: toBigInt(commitment, "commitment"),
+    permitRecipientAddr,
+    proofForContract
+  };
+}
 
-    // ── Semaphore proof preflight (same core verification path) ──
+async function relayStage(req, res) {
+  console.log("─────────────────────────────────────────");
+  console.log("STAGE RAW PROOF:", JSON.stringify(req.body.proof, null, 2));
+
+  try {
+    const v = await validateConsentAndSemaphoreProof(req.body, "stage");
+    if (v.error) return res.status(v.status).json({ error: v.error });
+
     try {
-      const isValidProof = await semaphore.verifyProof(groupId, proofForContract);
-      if (!isValidProof) {
-        return res.status(400).json({
-          error: "Semaphore proof invalid (expired root, unknown root, nullifier reused, or malformed proof)"
-        });
-      }
-    } catch (proofErr) {
-      const reason = extractErrorMessage(proofErr);
-      console.error("❌ Semaphore verifyProof failed:", reason);
-      return res.status(400).json({ error: "Semaphore proof verification failed: " + reason });
-    }
-
-    // ── Already applied check ─────────────────────────────────────
-    const alreadyApplied = await registry.hasAppliedToTrial(
-      BigInt(trialId),
-      BigInt(rawProof.nullifier)
-    );
-
-    if (alreadyApplied) {
-      return res.status(400).json({ error: "Already applied to this trial" });
-    }
-
-    // ── Static call ───────────────────────────────────────────────
-    try {
-      await registry.applyToTrial.staticCall(
-        toBigInt(trialId, "trialId"),
-        proofForContract,
-        toBigInt(commitment, "commitment"),
-        permitRecipientAddr
+      await registry.stageAnonymousApply.staticCall(
+        v.trialIdBI,
+        v.proofForContract,
+        v.commitmentBI,
+        v.permitRecipientAddr
       );
-      console.log("✅ staticCall passed");
+      console.log("✅ stage staticCall passed");
     } catch (staticErr) {
       const reason = extractErrorMessage(staticErr);
-      console.error("❌ Static call revert:", reason);
+      console.error("❌ Stage static call revert:", reason);
       return res.status(400).json({ error: "Contract would revert: " + reason });
     }
 
-    // ── Send TX ───────────────────────────────────────────────────
-    console.log(`Relaying: trialId=${trialId}`);
-    const trialIdBI = toBigInt(trialId, "trialId");
-    const commitmentBI = toBigInt(commitment, "commitment");
-    const estimatedGas = await registry.applyToTrial.estimateGas(
-      trialIdBI,
-      proofForContract,
-      commitmentBI,
-      permitRecipientAddr
+    const estimatedGas = await registry.stageAnonymousApply.estimateGas(
+      v.trialIdBI,
+      v.proofForContract,
+      v.commitmentBI,
+      v.permitRecipientAddr
     );
     const gasLimit = (estimatedGas * 130n) / 100n;
 
-    const tx = await registry.applyToTrial(
-      trialIdBI,
-      proofForContract,
-      commitmentBI,
-      permitRecipientAddr,
+    const tx = await registry.stageAnonymousApply(
+      v.trialIdBI,
+      v.proofForContract,
+      v.commitmentBI,
+      v.permitRecipientAddr,
       { gasLimit }
     );
 
     const receipt = await tx.wait();
-
-    console.log(`✅ TX confirmed: ${receipt.hash}`);
+    console.log(`✅ Stage TX confirmed: ${receipt.hash}`);
 
     res.json({ success: true, txHash: receipt.hash });
-
   } catch (err) {
     const reason = extractErrorMessage(err);
-    console.error("❌ Relay error:", reason);
+    console.error("❌ Stage relay error:", reason);
     res.status(500).json({ error: reason });
   }
+}
+
+async function relayFinalize(req, res) {
+  console.log("─────────────────────────────────────────");
+  console.log("FINALIZE RAW PROOF:", JSON.stringify(req.body.proof, null, 2));
+
+  try {
+    const { decryptedEligible, decryptSignature } = req.body;
+    if (decryptedEligible === undefined || decryptSignature === undefined) {
+      return res.status(400).json({ error: "Missing decryptedEligible or decryptSignature" });
+    }
+
+    let sigBytes = decryptSignature;
+    if (typeof sigBytes === "string" && !sigBytes.startsWith("0x")) {
+      sigBytes = "0x" + sigBytes;
+    }
+
+    const v = await validateConsentAndSemaphoreProof(req.body, "finalize");
+    if (v.error) return res.status(v.status).json({ error: v.error });
+
+    try {
+      await registry.finalizeAnonymousApply.staticCall(
+        v.trialIdBI,
+        v.proofForContract,
+        v.commitmentBI,
+        v.permitRecipientAddr,
+        Boolean(decryptedEligible),
+        sigBytes
+      );
+      console.log("✅ finalize staticCall passed");
+    } catch (staticErr) {
+      const reason = extractErrorMessage(staticErr);
+      console.error("❌ Finalize static call revert:", reason);
+      return res.status(400).json({ error: "Contract would revert: " + reason });
+    }
+
+    const estimatedGas = await registry.finalizeAnonymousApply.estimateGas(
+      v.trialIdBI,
+      v.proofForContract,
+      v.commitmentBI,
+      v.permitRecipientAddr,
+      Boolean(decryptedEligible),
+      sigBytes
+    );
+    const gasLimit = (estimatedGas * 130n) / 100n;
+
+    const tx = await registry.finalizeAnonymousApply(
+      v.trialIdBI,
+      v.proofForContract,
+      v.commitmentBI,
+      v.permitRecipientAddr,
+      Boolean(decryptedEligible),
+      sigBytes,
+      { gasLimit }
+    );
+
+    const receipt = await tx.wait();
+    console.log(`✅ Finalize TX confirmed: ${receipt.hash}`);
+
+    res.json({ success: true, txHash: receipt.hash });
+  } catch (err) {
+    const reason = extractErrorMessage(err);
+    console.error("❌ Finalize relay error:", reason);
+    res.status(500).json({ error: reason });
+  }
+}
+
+app.post("/relay/apply-stage", limiter, relayStage);
+app.post("/relay/apply-finalize", limiter, relayFinalize);
+
+/** @deprecated Use /relay/apply-stage then /relay/apply-finalize */
+app.post("/relay/apply", limiter, (_, res) => {
+  res.status(410).json({
+    error: "Deprecated: use POST /relay/apply-stage then POST /relay/apply-finalize (eligible-only CoFHE finalize gate)."
+  });
 });
 
 const PORT = process.env.PORT || 3000;
