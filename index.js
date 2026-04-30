@@ -58,6 +58,63 @@ function extractErrorMessage(err) {
   return err.shortMessage ?? err.reason ?? err.message ?? String(err);
 }
 
+function findRevertData(err, depth = 0) {
+  if (!err || depth > 10) return null;
+  if (typeof err.data === "string" && err.data.startsWith("0x") && err.data.length > 10) {
+    return err.data;
+  }
+  const fromNested =
+    findRevertData(err.error, depth + 1) ||
+    findRevertData(err.cause, depth + 1);
+  if (fromNested) return fromNested;
+  if (typeof err.info?.error?.data === "string" && err.info.error.data.startsWith("0x")) {
+    return err.info.error.data;
+  }
+  return null;
+}
+
+const ERROR_STRING_IFACE = new ethers.Interface(["error Error(string)"]);
+
+/** Attach decoded Error(string) or revert hex preview for CoFHE / custom errors. */
+function formatContractRevert(err) {
+  const base = extractErrorMessage(err);
+  const data = findRevertData(err);
+  if (!data) return base;
+  try {
+    const parsed = ERROR_STRING_IFACE.parseError(data);
+    if (parsed && parsed.name === "Error") {
+      return `${base} | Solidity Error(string): ${parsed.args[0]}`;
+    }
+  } catch {
+    /* not Error(string) */
+  }
+  const byteLen = Math.floor((data.length - 2) / 2);
+  return `${base} | revertData=${data.slice(0, 14)}… (${byteLen} bytes, likely CoFHE/TaskManager custom error — compare REGISTRY_ADDRESS + staged ctHash)`;
+}
+
+function normalizeDecryptSig(input) {
+  if (input == null || input === "") throw new Error("decryptSignature is empty");
+  if (typeof input === "string") {
+    const t = input.trim();
+    const s = t.startsWith("0x") ? t : "0x" + t;
+    const bytes = ethers.getBytes(s);
+    if (bytes.length === 0) throw new Error("decryptSignature decodes to 0 bytes");
+    return ethers.hexlify(bytes);
+  }
+  if (Array.isArray(input)) {
+    return ethers.hexlify(Uint8Array.from(input.map((n) => Number(n))));
+  }
+  throw new Error("decryptSignature must be hex string or numeric byte array");
+}
+
+function parseDecryptedEligible(val) {
+  if (val === true) return true;
+  if (val === false) return false;
+  if (val === "true" || val === 1 || val === "1") return true;
+  if (val === "false" || val === 0 || val === "0") return false;
+  throw new Error("decryptedEligible must be JSON boolean true/false");
+}
+
 function parseProofFromBody(rawProof) {
   return {
     merkleTreeDepth: toBigInt(rawProof.merkleTreeDepth, "proof.merkleTreeDepth"),
@@ -169,7 +226,7 @@ async function relayStage(req, res) {
       );
       console.log("✅ stage staticCall passed");
     } catch (staticErr) {
-      const reason = extractErrorMessage(staticErr);
+      const reason = formatContractRevert(staticErr);
       console.error("❌ Stage static call revert:", reason);
       return res.status(400).json({ error: "Contract would revert: " + reason });
     }
@@ -211,10 +268,18 @@ async function relayFinalize(req, res) {
       return res.status(400).json({ error: "Missing decryptedEligible or decryptSignature" });
     }
 
-    let sigBytes = decryptSignature;
-    if (typeof sigBytes === "string" && !sigBytes.startsWith("0x")) {
-      sigBytes = "0x" + sigBytes;
+    let decElig;
+    let sigBytes;
+    try {
+      decElig = parseDecryptedEligible(decryptedEligible);
+      sigBytes = normalizeDecryptSig(decryptSignature);
+    } catch (normErr) {
+      return res.status(400).json({ error: normErr.message || String(normErr) });
     }
+
+    console.log(
+      `finalize meta: decryptedEligible=${decElig} sigBytes=${Math.floor((sigBytes.length - 2) / 2)} registry=${REGISTRY_ADDRESS}`
+    );
 
     const v = await validateConsentAndSemaphoreProof(req.body, "finalize");
     if (v.error) return res.status(v.status).json({ error: v.error });
@@ -225,12 +290,12 @@ async function relayFinalize(req, res) {
         v.proofForContract,
         v.commitmentBI,
         v.permitRecipientAddr,
-        Boolean(decryptedEligible),
+        decElig,
         sigBytes
       );
       console.log("✅ finalize staticCall passed");
     } catch (staticErr) {
-      const reason = extractErrorMessage(staticErr);
+      const reason = formatContractRevert(staticErr);
       console.error("❌ Finalize static call revert:", reason);
       return res.status(400).json({ error: "Contract would revert: " + reason });
     }
@@ -240,7 +305,7 @@ async function relayFinalize(req, res) {
       v.proofForContract,
       v.commitmentBI,
       v.permitRecipientAddr,
-      Boolean(decryptedEligible),
+      decElig,
       sigBytes
     );
     const gasLimit = (estimatedGas * 130n) / 100n;
@@ -250,7 +315,7 @@ async function relayFinalize(req, res) {
       v.proofForContract,
       v.commitmentBI,
       v.permitRecipientAddr,
-      Boolean(decryptedEligible),
+      decElig,
       sigBytes,
       { gasLimit }
     );
